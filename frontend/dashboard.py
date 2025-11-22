@@ -9,7 +9,6 @@ import streamlit as st
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PATH = os.path.join(ROOT, "models", "fraud_model.pkl")
 SCALER_PATH = os.path.join(ROOT, "models", "scaler.pkl")
-DATA_PATH = os.path.join(ROOT, "data", "creditcard_mini.csv")
 
 # =========================
 #   LOAD MODEL + SCALER
@@ -22,43 +21,84 @@ def load_model_and_scaler():
 
 
 # =========================
-#     LOAD RAW DATA
+#   ENRICH + PREDICT
 # =========================
-@st.cache_data
-def load_raw_data():
-    df = pd.read_csv(DATA_PATH)
-    return df
+def enrich_and_predict(df: pd.DataFrame, model, scaler):
+    df = df.copy()
 
+    # --- target column ---
+    if "is_fraud" not in df.columns:
+        if "Class" in df.columns:
+            df = df.rename(columns={"Class": "is_fraud"})
+        else:
+            # dacă nu avem label, punem 0 (necunoscut / non-fraud)
+            df["is_fraud"] = 0
 
-# =========================
-#     PREPARE DATA
-# =========================
-def prepare_data(df: pd.DataFrame, model, scaler):
-    # 1. Asigurăm consistența cu train_model.py
-    if "Class" in df.columns:
-        df = df.rename(columns={"Class": "is_fraud"})
+    # --- datetime parsing ---
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df["hour"] = df["datetime"].dt.hour.fillna(0).astype(int)
+        df["date"] = df["datetime"].dt.date
+    else:
+        df["datetime"] = pd.NaT
+        df["hour"] = 0
+        df["date"] = None
 
-    # 2. Filtru micro-tranzacții (la fel ca în train_model.py)
+    # --- micro-filter ---
+    if "Amount" not in df.columns:
+        raise ValueError("CSV-ul trebuie să conțină o coloană 'Amount'.")
+
     df = df[df["Amount"] <= 100.0].copy()
 
-    # 3. Alegem EXACT features-urile pe care a fost antrenat scalerul
-    feature_cols = getattr(scaler, "feature_names_in_", None)
+    if len(df) == 0:
+        raise ValueError("După filtrul Amount <= 100 nu a mai rămas nicio tranzacție.")
 
-    if feature_cols is not None:
-        # dacă StandardScaler are salvat numele coloanelor, le folosim direct
-        features = df[feature_cols]
+    # --- agregări contextuale ---
+    if "transaction_id" not in df.columns:
+        df["transaction_id"] = [f"T{idx:06d}" for idx in range(len(df))]
+
+    if "user_id" in df.columns:
+        df["user_tx_total"] = df.groupby("user_id")["transaction_id"].transform("count")
+        df["user_countries_count"] = df.groupby("user_id")["country"].transform("nunique") if "country" in df.columns else 1
     else:
-        # fallback – ar trebui să nu mai ajungem aici, dar e safe
-        cols_to_drop = ["user_id", "id", "Time", "Unnamed: 0", "is_fraud", "Class"]
-        features = df.drop(cols_to_drop, axis=1, errors="ignore")
+        df["user_tx_total"] = 1
+        df["user_countries_count"] = 1
 
-    # 4. Scalăm și facem predicții
-    scaled = scaler.transform(features)
+    if "merchant_id" in df.columns:
+        df["merchant_tx_total"] = df.groupby("merchant_id")["transaction_id"].transform("count")
+        # merchant fraud rate poate fi calculat doar dacă avem label (is_fraud)
+        df["merchant_fraud_rate"] = df.groupby("merchant_id")["is_fraud"].transform("mean")
+    else:
+        df["merchant_tx_total"] = 1
+        df["merchant_fraud_rate"] = 0.0
 
+    if "user_id" in df.columns and "merchant_id" in df.columns:
+        df["user_merchant_tx_total"] = df.groupby(["user_id", "merchant_id"])["transaction_id"].transform("count")
+    else:
+        df["user_merchant_tx_total"] = 1
+
+    # --- features pentru model: EXACT ca la antrenare ---
+    feature_cols = getattr(scaler, "feature_names_in_", None)
+    if feature_cols is None:
+        raise ValueError(
+            "Scaler-ul nu are feature_names_in_. Asigură-te că l-ai salvat după fit pe un DataFrame cu nume de coloane."
+        )
+
+    missing_features = [col for col in feature_cols if col not in df.columns]
+    if missing_features:
+        raise ValueError(
+            f"CSV-ul încărcat NU are toate coloanele necesare pentru model.\n"
+            f"Lipsesc coloanele: {missing_features}"
+        )
+
+    X = df[feature_cols]
+
+    # --- scaling + predicții ---
+    scaled = scaler.transform(X)
     df["fraud_prediction"] = model.predict(scaled)
     df["risk_score"] = model.predict_proba(scaled)[:, 1]
 
-    return df, list(features.columns)
+    return df
 
 
 # =========================
@@ -73,13 +113,10 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-/* Main container padding */
 .block-container {
     padding-top: 2rem;
     padding-bottom: 2rem;
 }
-
-/* Title */
 .big-title {
     font-size: 44px;
     font-weight: 800;
@@ -90,8 +127,6 @@ st.markdown(
     font-size: 18px;
     color: #4b5563;
 }
-
-/* Hero pill */
 .hero-pill {
     display: inline-flex;
     align-items: center;
@@ -103,8 +138,6 @@ st.markdown(
     font-size: 13px;
     font-weight: 600;
 }
-
-/* Metric cards */
 .metric-card {
     padding: 18px 18px 14px 18px;
     border-radius: 16px;
@@ -127,8 +160,6 @@ st.markdown(
     font-size: 12px;
     color: #6b7280;
 }
-
-/* Risk badges */
 .risk-high {
     background-color: #ef4444;
     padding: 4px 10px;
@@ -153,23 +184,17 @@ st.markdown(
     font-weight: 600;
     font-size: 12px;
 }
-
-/* Table container */
 .table-box {
     background: #020617;
     border-radius: 18px;
     border: 1px solid rgba(148, 163, 184, 0.35);
     padding: 16px 16px 4px 16px;
 }
-
-/* Section titles */
 .section-title {
     font-weight: 700;
     font-size: 20px;
     color: #e5e7eb;
 }
-
-/* Transaction inspector */
 .inspect-box {
     background: #020617;
     border-radius: 18px;
@@ -177,14 +202,10 @@ st.markdown(
     padding: 18px;
     color: #e5e7eb;
 }
-
-/* Small grey text */
 .small-muted {
     font-size: 12px;
     color: #9ca3af;
 }
-
-/* Override default headers color */
 h1, h2, h3, h4 {
     color: #e5e7eb !important;
 }
@@ -200,44 +221,69 @@ st.markdown(
     '<div class="hero-pill">🛡️ AI Hackathon · Micro-Fraud Detection</div>',
     unsafe_allow_html=True,
 )
-
 st.markdown(
     '<p class="big-title">AI pentru prevenirea fraudelor mici<br/>prin analiza micro-tranzacțiilor</p>',
     unsafe_allow_html=True,
 )
 st.markdown(
-    '<p class="subtext">Modelul filtrează micro-tranzacțiile (≤ 100 unități), le '
-    'preprocesează și folosește un <strong>Random Forest</strong> antrenat pe date reale pentru '
-    'a atribui fiecărei tranzacții un <strong>scor de risc de fraudă</strong>.</p>',
+    '<p class="subtext">Încarcă propriul tău fișier CSV cu tranzacții, iar modelul antrenat analizează fiecare micro-tranzacție '
+    'în context: utilizator, comerciant, țară, oră și istoric.</p>',
     unsafe_allow_html=True,
 )
 
 st.write("")
 tag_cols = st.columns(4)
-tag_cols[0].markdown("✅ Random Forest classifier")
-tag_cols[1].markdown("📊 Feature scaling & preprocessing")
-tag_cols[2].markdown("💸 Focus pe micro-tranzacții")
-tag_cols[3].markdown("👀 Scor de risc explicabil")
-
+tag_cols[0].markdown("✅ Model Random Forest antrenat")
+tag_cols[1].markdown("📂 CSV upload direct din browser")
+tag_cols[2].markdown("🌍 Context user / merchant / country")
+tag_cols[3].markdown("👀 Explicații pentru tranzacțiile suspecte")
 st.markdown("---")
 
 # =========================
-#   LOAD MODEL + DATA
+#   LOAD MODEL
 # =========================
 try:
     model, scaler = load_model_and_scaler()
-    raw_df = load_raw_data()
-    df, feature_names = prepare_data(raw_df, model, scaler)
 except Exception as e:
-    st.error(
-        "Nu am reușit să încarc modelul sau datele. "
-        "Verifică structura folderelor și fișierele .pkl / .csv."
-    )
+    st.error("Nu am reușit să încarc modelul sau scaler-ul. Verifică fișierele din folderul 'models/'.")
     st.exception(e)
     st.stop()
 
 # =========================
-#        TOP METRICS
+#   FILE UPLOADER
+# =========================
+uploaded_file = st.file_uploader(
+    "Încarcă un fișier CSV cu tranzacții (trebuie să aibă cel puțin coloanele folosite la antrenare: Amount, V1..V28, etc.)",
+    type=["csv"],
+)
+
+if uploaded_file is None:
+    st.info(
+        "👆 Încarcă un fișier CSV ca să vezi analiza. "
+        "Ideal, folosește același format ca setul de antrenare: "
+        "`transaction_id, user_id, merchant_id, country, channel, datetime, Amount, Class/is_fraud, V1..V28`."
+    )
+    st.stop()
+
+try:
+    raw_df = pd.read_csv(uploaded_file)
+except Exception as e:
+    st.error("Nu am putut citi fișierul CSV. Verifică dacă este un CSV valid.")
+    st.exception(e)
+    st.stop()
+
+# =========================
+#   PREDICTIONS + ENRICH
+# =========================
+try:
+    df = enrich_and_predict(raw_df, model, scaler)
+except Exception as e:
+    st.error("A apărut o eroare la procesarea datelor și calculul scorurilor.")
+    st.exception(e)
+    st.stop()
+
+# =========================
+#        METRICS
 # =========================
 total_tx = len(df)
 fraud_rate = df["fraud_prediction"].mean() if total_tx > 0 else 0
@@ -245,40 +291,36 @@ avg_amount = df["Amount"].mean() if total_tx > 0 else 0
 max_risk = df["risk_score"].max() if total_tx > 0 else 0
 
 m1, m2, m3, m4 = st.columns(4)
-
 m1.markdown(
     f"""
 <div class="metric-card">
     <div class="metric-label">Total micro-tranzacții analizate</div>
     <div class="metric-value">{total_tx}</div>
-    <div class="metric-sub">filtrate cu limită ≤ 100</div>
+    <div class="metric-sub">tranzacții cu Amount ≤ 100</div>
 </div>
 """,
     unsafe_allow_html=True,
 )
-
 m2.markdown(
     f"""
 <div class="metric-card">
-    <div class="metric-label">Rată estimată de tranzacții suspecte</div>
+    <div class="metric-label">Rată tranzacții suspecte (model)</div>
     <div class="metric-value">{fraud_rate*100:.2f}%</div>
-    <div class="metric-sub">bazat pe predicția modelului</div>
+    <div class="metric-sub">procent din micro-tranzacțiile încărcate</div>
 </div>
 """,
     unsafe_allow_html=True,
 )
-
 m3.markdown(
     f"""
 <div class="metric-card">
-    <div class="metric-label">Valoare medie a micro-tranzacțiilor</div>
+    <div class="metric-label">Valoare medie micro-tranzacții</div>
     <div class="metric-value">{avg_amount:.2f}</div>
     <div class="metric-sub">unități monetare</div>
 </div>
 """,
     unsafe_allow_html=True,
 )
-
 m4.markdown(
     f"""
 <div class="metric-card">
@@ -292,6 +334,7 @@ m4.markdown(
 
 st.markdown("---")
 
+
 # =========================
 #    HELPER: RISK BADGE
 # =========================
@@ -304,15 +347,14 @@ def risk_badge(score: float) -> str:
 
 
 # =========================
-#    TABLE + INSPECTOR
+#   TABLE + INSPECTOR
 # =========================
 left, right = st.columns([2.2, 1])
 
 with left:
     st.markdown('<div class="section-title">📊 Micro-tranzacții și scorul de risc</div>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="small-muted">Fiecare rând reprezintă o micro-tranzacție filtrată din setul de date real, '
-        'cu scorul de risc calculat de model.</p>',
+        '<p class="small-muted">Tabelul de mai jos este calculat din fișierul tău CSV încărcat în aplicație.</p>',
         unsafe_allow_html=True,
     )
 
@@ -320,20 +362,29 @@ with left:
     df_view["Risk Level"] = df_view["risk_score"].apply(risk_badge)
     df_view["Fraud (model)"] = df_view["fraud_prediction"].map({0: "Legit", 1: "⚠ Fraud-like"})
 
-    show_cols = ["Amount", "risk_score", "Risk Level", "Fraud (model)"]
+    show_cols = [
+        "transaction_id",
+        "user_id",
+        "merchant_id",
+        "country",
+        "Amount",
+        "risk_score",
+        "Risk Level",
+        "Fraud (model)",
+    ]
     existing = [c for c in show_cols if c in df_view.columns]
 
     st.markdown(
         "<div class='table-box'>"
-        + df_view[existing].head(150).to_html(escape=False, index=False)
+        + df_view[existing].head(200).to_html(escape=False, index=False)
         + "</div>",
         unsafe_allow_html=True,
     )
 
 with right:
-    st.markdown('<div class="section-title">🔍 Inspector de tranzacții</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🔍 Inspector detaliat de tranzacții</div>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="small-muted">Selectează o tranzacție pentru a vedea cum o interpretează modelul AI.</p>',
+        '<p class="small-muted">Alege o tranzacție din setul încărcat pentru a vedea contextul complet.</p>',
         unsafe_allow_html=True,
     )
 
@@ -347,88 +398,81 @@ with right:
             value=0,
             key="tx_index_slider",
         )
-
         tx = df.iloc[idx]
 
         st.markdown("<div class='inspect-box'>", unsafe_allow_html=True)
-        st.markdown(f"**Tranzacția #{idx}**")
+        st.markdown(f"**Tranzacția #{idx} · ID: `{tx['transaction_id']}`**")
+        if "user_id" in tx:
+            st.write(f"**User:** `{tx['user_id']}`")
+        if "merchant_id" in tx:
+            st.write(f"**Merchant:** `{tx['merchant_id']}`")
+        if "country" in tx:
+            st.write(f"**Țară:** `{tx['country']}`")
+        if "channel" in tx:
+            st.write(f"**Channel:** `{tx['channel']}`")
+        st.write(f"**Data/Ora:** `{tx['datetime']}`")
         st.write(f"**Amount:** `{tx['Amount']:.2f}`")
-        st.write(f"**Scor de risc:** `{tx['risk_score']:.3f}`")
+        st.write(f"**Scor de risc (model):** `{tx['risk_score']:.3f}`")
         prediction_label = "⚠️ Probabil fraudă" if tx["fraud_prediction"] == 1 else "✔️ Tranzacție legită"
         st.write(f"**Predicție model:** {prediction_label}")
 
-        if tx["risk_score"] >= 0.85:
-            st.markdown("##### 🟥 De ce o considerăm foarte suspectă?")
-            st.markdown(
-                """
-- Valoare mică (micro-tranzacție), un pattern comun în fraudele „invizibile”
-- Combinație de features (V1..V28) similară cu tranzacțiile etichetate ca fraudă
-- Modelul Random Forest a dat un scor mare pentru această configurație de date
-                """
+        st.write("---")
+        st.markdown("#### 📌 Context agregat")
+        st.write(f"- Total tranzacții ale user-ului: `{tx.get('user_tx_total', 'n/a')}`")
+        st.write(f"- Tranzacții user → acest merchant: `{tx.get('user_merchant_tx_total', 'n/a')}`")
+        st.write(f"- Total tranzacții ale merchant-ului: `{tx.get('merchant_tx_total', 'n/a')}`")
+        if "merchant_fraud_rate" in tx and not pd.isna(tx["merchant_fraud_rate"]):
+            st.write(f"- Rata de fraudă la acest merchant (în datele încărcate): `{tx['merchant_fraud_rate']*100:.1f}%`")
+        st.write(f"- Număr de țări diferite folosite de user: `{tx.get('user_countries_count', 'n/a')}`")
+        st.write(f"- Ora tranzacției: `{int(tx['hour'])}:00`")
+
+        st.write("---")
+        st.markdown("#### 🧠 De ce poate fi considerată suspectă?")
+
+        reasons = []
+        if tx.get("user_merchant_tx_total", 0) >= 5 and tx["Amount"] < 20:
+            reasons.append(
+                f"- User-ul are `{tx['user_merchant_tx_total']}` micro-tranzacții către **același merchant**."
             )
-        elif tx["risk_score"] >= 0.5:
-            st.markdown("##### 🟧 Activitate potențial suspectă")
-            st.markdown(
-                """
-- Unele caracteristici seamănă cu pattern-uri de fraudă,
-  dar nu suficient de puternic pentru a fi 100% fraudă
-- Recomandare: verificare manuală de către un analist de risc
-                """
+        if tx.get("user_countries_count", 0) >= 3:
+            reasons.append(
+                f"- User-ul a tranzacționat din `{tx['user_countries_count']}` țări diferite (posibil geo-hopping)."
             )
+        if int(tx["hour"]) < 5 or int(tx["hour"]) >= 23:
+            reasons.append("- Tranzacție efectuată la o oră atipică (noaptea / foarte târziu).")
+        if "merchant_fraud_rate" in tx and not pd.isna(tx["merchant_fraud_rate"]) and tx["merchant_fraud_rate"] >= 0.3:
+            reasons.append(
+                f"- Merchant cu istoric de fraudă ridicat în datele tale: `{tx['merchant_fraud_rate']*100:.1f}%`."
+            )
+        if tx["fraud_prediction"] == 1 and not reasons:
+            reasons.append(
+                "- Pattern numeric (V1..V28 + Amount) foarte similar cu tranzacțiile frauduloase din setul de antrenare."
+            )
+        if not reasons:
+            reasons.append("- Nu există semnale foarte puternice; modelul consideră tranzacția relativ normală.")
+
+        for r in reasons:
+            st.write(r)
+
+        st.write("---")
+        st.markdown("#### 📜 Istoric user ↔ merchant (primele 20)")
+
+        if "user_id" in df.columns and "merchant_id" in df.columns:
+            mask = (df["user_id"] == tx["user_id"]) & (df["merchant_id"] == tx["merchant_id"])
+            history = df.loc[mask, ["datetime", "Amount", "risk_score", "fraud_prediction"]].sort_values("datetime").head(20)
+            history = history.rename(
+                columns={
+                    "datetime": "Datetime",
+                    "Amount": "Amount",
+                    "risk_score": "RiskScore",
+                    "fraud_prediction": "Fraud(0/1)",
+                }
+            )
+            st.dataframe(history, use_container_width=True)
         else:
-            st.markdown("##### 🟩 Tranzacție în zona „normală”")
-            st.markdown(
-                """
-- Nu prezintă pattern-uri similare cu tranzacțiile frauduloase din setul de antrenare
-- Scorul de risc este scăzut, dar sistemul o păstrează în istoric pentru învățare viitoare
-                """
-            )
+            st.write("Nu pot genera istoricul user ↔ merchant: lipsesc coloanele 'user_id' sau 'merchant_id' în CSV.")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("---")
-
-# =========================
-#   PIPELINE EXPLANATION
-# =========================
-st.markdown("### 🔗 Cum funcționează pipeline-ul nostru AI (pe scurt)")
-
-col_a, col_b, col_c, col_d = st.columns(4)
-
-col_a.markdown(
-    """
-**1. Ingest & Filter**  
-• Importăm date reale din `creditcard_mini.csv`  
-• Păstrăm doar tranzacțiile cu `Amount ≤ 100`  
-• Focus pe fraudele mici, greu de observat manual
-"""
-)
-
-col_b.markdown(
-    """
-**2. Preprocesare & Feature Engineering**  
-• Eliminăm coloanele care nu ajută modelul (`id`, `Time`, etc.)  
-• Scălăm numeric features cu `StandardScaler`  
-• Obținem un vector numeric pentru fiecare tranzacție
-"""
-)
-
-col_c.markdown(
-    """
-**3. Model Random Forest**  
-• Antrenat în `ai_model/train_model.py`  
-• Folosește `class_weight='balanced'` pentru a trata dezechilibrul de clase  
-• Învață tiparele subtile dintre tranzacții legitime și fraude
-"""
-)
-
-col_d.markdown(
-    """
-**4. Scor de risc & Dashboard**  
-• Pentru fiecare tranzacție calculăm `fraud_prediction` și `risk_score`  
-• Afișăm scorurile, badge-urile de risc și explicații  
-• Ușor de integrat într-un sistem de monitorizare real-time
-"""
-)
-
-st.success("Gus")
+st.success("Dashboard-ul a analizat cu succes fișierul CSV încărcat. 🚀")
