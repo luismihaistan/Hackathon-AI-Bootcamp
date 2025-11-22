@@ -6,7 +6,6 @@ from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.preprocessing import StandardScaler
 import joblib
 import os
-
 # --- CONFIGURARE CĂI (PATHS) ---
 # Aflăm unde se află acest script (în folderul ai_model)
 current_dir = os.path.dirname(os.path.abspath(__file__))
