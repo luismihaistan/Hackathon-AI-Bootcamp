@@ -64,7 +64,6 @@ def preprocesare_date(df):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    # Returnăm scaler-ul ca să îl putem salva
     return X_scaled, y, scaler
 
 # 3. ANTRENARE MODEL
@@ -90,7 +89,7 @@ def antreneaza_model():
         n_estimators=100, 
         max_depth=10, 
         random_state=42, 
-        class_weight='balanced', # Important pentru date dezechilibrate (frauda e rară)
+        class_weight='balanced',
         n_jobs=-1
     )
     
